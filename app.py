@@ -175,6 +175,69 @@ def load_and_train():
     rmse_fed = float(np.sqrt(mean_squared_error(y_test, preds_real)))
     r2_fed = float(r2_score(y_test, preds_real))
 
+    # ---- Federated (FedProx + Top-k Sparsification) MLP, non-IID clients ----
+    # Mirrors the notebook's "Run 3" experiment: clients are partitioned
+    # non-IID (sorted by the first feature) to simulate heterogeneous farms,
+    # local updates are regularized toward the global model (FedProx), and
+    # only the top-20% largest per-client weight deltas are transmitted
+    # back before averaging (sparsified communication).
+    sorted_idx = np.argsort(X_train_scaled[:, 0])
+    client_splits_noniid = np.array_split(sorted_idx, num_clients)
+    noniid_loaders = []
+    for idxs in client_splits_noniid:
+        Xc = torch.tensor(X_train_scaled[idxs], dtype=torch.float32)
+        yc = torch.tensor(y_train_scaled[idxs], dtype=torch.float32)
+        noniid_loaders.append(DataLoader(TensorDataset(Xc, yc), batch_size=batch_size, shuffle=True))
+    noniid_weights = [len(idxs) / len(sorted_idx) for idxs in client_splits_noniid]
+
+    mu = 0.05
+    topk_fraction = 0.20
+    fedprox_model = MLP(in_dim).to(device)
+    for _ in range(1, rounds + 1):
+        global_params = get_model_params(fedprox_model)
+        global_tensors = {k: v.to(device) for k, v in fedprox_model.state_dict().items()}
+        local_params = []
+        for cid in range(num_clients):
+            client_model = MLP(in_dim).to(device)
+            set_model_params(client_model, global_params)
+            opt = optim.Adam(client_model.parameters(), lr=lr)
+            loss_fn = nn.MSELoss()
+            client_model.train()
+            for _epoch in range(local_epochs):
+                for xb, yb in noniid_loaders[cid]:
+                    opt.zero_grad()
+                    base_loss = loss_fn(client_model(xb), yb)
+                    prox_term = sum(
+                        torch.sum((p - global_tensors[name]) ** 2)
+                        for name, p in client_model.named_parameters()
+                        if name in global_tensors
+                    )
+                    loss = base_loss + (mu / 2.0) * prox_term
+                    loss.backward()
+                    opt.step()
+
+            # Top-k sparsification: only keep the largest-magnitude weight
+            # deltas for this client, reverting the rest to the global value.
+            c_params = get_model_params(client_model)
+            all_deltas = torch.cat([(c_params[k] - global_params[k]).abs().flatten() for k in c_params])
+            topk_count = max(1, int(all_deltas.numel() * topk_fraction))
+            threshold = torch.topk(all_deltas, topk_count).values[-1]
+            sparsified = {}
+            for k in c_params:
+                delta = c_params[k] - global_params[k]
+                mask = delta.abs() >= threshold
+                sparsified[k] = torch.where(mask, c_params[k], global_params[k])
+            local_params.append(sparsified)
+
+        set_model_params(fedprox_model, average_params(local_params, noniid_weights))
+
+    fedprox_model.eval()
+    with torch.no_grad():
+        preds_scaled = fedprox_model(torch.tensor(X_test_scaled, dtype=torch.float32)).numpy()
+        preds_real = scaler_y.inverse_transform(preds_scaled)
+    rmse_fedprox = float(np.sqrt(mean_squared_error(y_test, preds_real)))
+    r2_fedprox = float(r2_score(y_test, preds_real))
+
     return {
         "options": options,
         "model_columns": model_columns,
@@ -182,7 +245,12 @@ def load_and_train():
         "scaler_y": scaler_y,
         "xgb": xgb_model,
         "fed_model": global_model,
-        "metrics": {"rmse_xgb": rmse_xgb, "r2_xgb": r2_xgb, "rmse_fed": rmse_fed, "r2_fed": r2_fed},
+        "fedprox_model": fedprox_model,
+        "metrics": {
+            "rmse_xgb": rmse_xgb, "r2_xgb": r2_xgb,
+            "rmse_fed": rmse_fed, "r2_fed": r2_fed,
+            "rmse_fedprox": rmse_fedprox, "r2_fedprox": r2_fedprox,
+        },
     }
 
 
@@ -199,10 +267,18 @@ def process_inputs(user_inputs, res):
     return res["scaler_x"].transform(df_in)
 
 
-def predict_fed(X_scaled, res):
+def predict_torch(model, X_scaled, res):
     with torch.no_grad():
-        p_sc = res["fed_model"](torch.tensor(X_scaled, dtype=torch.float32)).numpy()
+        p_sc = model(torch.tensor(X_scaled, dtype=torch.float32)).numpy()
     return float(res["scaler_y"].inverse_transform(p_sc)[0][0])
+
+
+def predict_fed(X_scaled, res):
+    return predict_torch(res["fed_model"], X_scaled, res)
+
+
+def predict_fedprox(X_scaled, res):
+    return predict_torch(res["fedprox_model"], X_scaled, res)
 
 
 def predict_xgb(X_scaled, res):
@@ -216,16 +292,19 @@ res = load_and_train()
 
 st.title("\U0001F33E Smart Farming: Federated vs Centralized AI")
 st.markdown(
-    "Compare a **Centralized XGBoost model** against a **Federated model (FedAvg)** "
-    "trained on the Smart Farming Crop Yield dataset."
+    "Compare **Centralized XGBoost**, **Federated (Plain FedAvg)**, and "
+    "**Federated (FedProx + Top-k Sparsified)** models trained on the Smart Farming Crop Yield dataset."
 )
 
 m = res["metrics"]
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Centralized RMSE", f"{m['rmse_xgb']:.1f} kg/ha")
-c2.metric("Centralized R²", f"{m['r2_xgb']:.3f}")
-c3.metric("Federated RMSE", f"{m['rmse_fed']:.1f} kg/ha")
-c4.metric("Federated R²", f"{m['r2_fed']:.3f}")
+metrics_df = pd.DataFrame(
+    [
+        {"Model": "Centralized XGBoost", "RMSE (kg/ha)": round(m["rmse_xgb"], 1), "R²": round(m["r2_xgb"], 3)},
+        {"Model": "Federated (Plain FedAvg)", "RMSE (kg/ha)": round(m["rmse_fed"], 1), "R²": round(m["r2_fed"], 3)},
+        {"Model": "Federated (FedProx + Top-k)", "RMSE (kg/ha)": round(m["rmse_fedprox"], 1), "R²": round(m["r2_fedprox"], 3)},
+    ]
+).set_index("Model")
+st.dataframe(metrics_df, use_container_width=True)
 
 st.sidebar.header("Farm Conditions")
 inputs = {}
@@ -256,15 +335,19 @@ tab1, tab2, tab3 = st.tabs(["\U0001F4CA Yield Prediction", "\U0001F331 Crop Reco
 
 with tab1:
     st.subheader("Yield Prediction Comparison")
-    colA, colB = st.columns(2)
+    colA, colB, colC = st.columns(3)
     with colA:
-        st.info("**Federated Model (FedAvg)**")
-        st.metric("Predicted Yield", f"{predict_fed(X_scaled, res):.2f} kg/ha")
-        st.caption("Trained on decentralized data partitions.")
-    with colB:
-        st.success("**Centralized Model (XGBoost)**")
+        st.success("**Centralized XGBoost**")
         st.metric("Predicted Yield", f"{predict_xgb(X_scaled, res):.2f} kg/ha")
         st.caption("Trained on the full dataset at once.")
+    with colB:
+        st.info("**Federated (Plain FedAvg)**")
+        st.metric("Predicted Yield", f"{predict_fed(X_scaled, res):.2f} kg/ha")
+        st.caption("Basic federated averaging over 5 IID clients.")
+    with colC:
+        st.warning("**Federated (FedProx + Top-k)**")
+        st.metric("Predicted Yield", f"{predict_fedprox(X_scaled, res):.2f} kg/ha")
+        st.caption("Optimized for non-IID clients + sparsified updates.")
 
 with tab2:
     st.subheader("Best Crop Recommendation")
@@ -298,4 +381,7 @@ with tab3:
         st.info(f"\U0001F4C5 Optimum Harvest: **{int(peak['Days'])} days**")
         st.line_chart(ddf.set_index("Days"))
 
-st.caption("Model source: final.ipynb (centralized XGBoost baseline vs. simulated FedAvg federated learning).")
+st.caption(
+    "Model source: final.ipynb -- centralized XGBoost baseline vs. simulated federated learning "
+    "(plain FedAvg on IID clients, and FedProx + Top-k sparsification on non-IID clients)."
+)
